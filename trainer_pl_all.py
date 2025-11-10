@@ -1,0 +1,822 @@
+# helper package
+# try:
+#     import warnings
+#     warnings.filterwarnings("ignore", message="Gimbal lock detected. Setting third angle to zero")
+#     warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.cuda.amp.custom_bwd.*")
+#     warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.cuda.amp.custom_fwd.*")
+# except:
+#     pass
+
+
+import pathlib
+import os
+import os
+from typing import Type, Dict, Any
+import copy
+import random
+import numpy as np
+from natsort import natsorted
+
+# framework package
+import torch
+from torch.utils.data import DataLoader, Dataset
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger, WandbLogger
+import pytorch_lightning as pl
+
+# jiandecouple package
+from jiandecouple.policy.diffusion_unet_hybrid_image_policy import DiffusionUnetHybridImagePolicy
+from jiandecouple.policy.diffusion_transformer_hybrid_image_policy import DiffusionTransformerHybridImagePolicy
+from jiandecouple.dataset.base_dataset import BaseImageDataset
+from jiandecouple.env_runner.base_image_runner import BaseImageRunner
+
+from jiandecouple.common.pytorch_util import dict_apply, optimizer_to
+from jiandecouple.model.diffusion.ema_model import EMAModel
+from jiandecouple.model.common.lr_scheduler import get_scheduler
+
+# Hydra specific imports
+import hydra
+from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
+from jiandecouple.config.config_hint import AppConfig
+
+from omegaconf import OmegaConf
+import hydra
+import sys
+
+# extra imports
+import mimicgen  # essential package, do not delete. Blame to complex dependency "robosuite->robomimic->mimicgen"
+
+# use line-buffering for both stdout and stderr
+sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
+sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+os.environ['TORCH_USE_CUDA_DSA'] = "1"
+os.environ['HYDRA_FULL_ERROR'] = "1"
+
+torch.set_float32_matmul_precision('medium')
+
+# ---------------------------------------------------------------
+# region 0. Tools
+
+
+def load_pretrained_weights(model, ckpt_path):
+    """
+    Load pretrained weights and freeze parameters according to the policy.
+
+    This function performs the following steps:
+    1. Record parameters that were already frozen before the function call.
+    2. Load weights from the given `ckpt_path`.
+    3. Load matched weights into the model.
+    4. Force-freeze all parameters in the 'clip' submodule and set it to eval mode.
+    5. Freeze all other parameters that were successfully loaded from the checkpoint.
+    6. Ensure parameters that were initially frozen remain frozen.
+    7. Keep the remaining parameters (e.g., new classification heads) trainable.
+
+    Args:
+        model (nn.Module): The model to load weights into and set gradients for.
+        ckpt_path (str): Path to the pretrained weight file (.pth).
+
+    Returns:
+        nn.Module: The processed model.
+    """
+    # --------------------------------------------------------------------------
+    # 0. record initially frozen parameters
+    # --------------------------------------------------------------------------
+    initially_frozen_keys = {name for name, param in model.named_parameters() if not param.requires_grad}
+    if initially_frozen_keys:
+        print(f"Detected {len(initially_frozen_keys)} parameters that were frozen before calling this function. They will remain frozen.")
+        # for name in initially_frozen_keys:
+        #     print(f"  - initially frozen: {name}")
+
+    if not ckpt_path:
+        print("No checkpoint path provided, skipping weight loading.")
+        # Even if we don't load weights, we still need to freeze CLIP and keep the initial frozen state
+        if hasattr(model, 'clip'):
+            print("Freezing CLIP module and setting it to eval mode...")
+            model.clip.eval()
+            for name, param in model.clip.named_parameters():
+                param.requires_grad = False
+                print(f"🧊 [force to freeze] {name}")
+        return model
+
+    # --------------------------------------------------------------------------
+    # 1. Identify loadable weights
+    # --------------------------------------------------------------------------
+    print(f"Loading weights from '{ckpt_path}'...")
+    pretrained_dict = torch.load(ckpt_path, map_location='cpu')['state_dict']
+
+    new_model_dict = model.state_dict()
+    loadable_keys = set()
+    filtered_dict = {}
+
+    print("Filtering compatible weights...")
+    for k, v in pretrained_dict.items():
+        if k in new_model_dict and new_model_dict[k].shape == v.shape:
+            filtered_dict[k] = v
+            loadable_keys.add(k)
+    print(f"Identified {len(loadable_keys)} parameters that can be safely loaded from checkpoint.")
+
+    # --------------------------------------------------------------------------
+    # Step 2: Load filtered weights
+    # --------------------------------------------------------------------------
+    new_model_dict.update(filtered_dict)
+    model.load_state_dict(new_model_dict)
+    print("Successfully loaded all compatible weights.")
+
+    # --------------------------------------------------------------------------
+    # 3. Force-set CLIP module to eval mode
+    # --------------------------------------------------------------------------
+    if hasattr(model, 'clip'):
+        print("Setting CLIP module to eval mode (model.clip.eval())...")
+        model.clip.eval()
+    else:
+        print("⚠️  Warning: 'clip' attribute not found in model, unable to set to eval mode.")
+
+    # --------------------------------------------------------------------------
+    # 4. Smartly set gradient status based on loading status, module name, and initial state
+    # --------------------------------------------------------------------------
+    print("Smartly setting gradient status for parameters...")
+    trainable_params = 0
+    frozen_params = 0
+
+    for name, param in model.named_parameters():
+        # Check if the parameter was initially frozen
+        is_initially_frozen = name in initially_frozen_keys
+        # Check if the parameter belongs to the CLIP module
+        is_clip_param = name.startswith('clip.')
+        # Check if the parameter was loaded from the checkpoint
+        is_loaded_from_ckpt = name in loadable_keys
+
+        # Smart logic: check if bias's corresponding weight was also loaded
+        if name.endswith('.bias') and not is_clip_param and not is_initially_frozen:
+            weight_name = name.replace('.bias', '.weight')
+            if weight_name not in loadable_keys:
+                is_loaded_from_ckpt = False
+                print(f"ℹ️  Note: Bias '{name}' will remain trainable as its corresponding weight '{weight_name}' was not loaded.")
+
+        # Final freezing decision: freeze if initially frozen, CLIP param, or loaded from checkpoint
+        if is_initially_frozen or is_clip_param or is_loaded_from_ckpt:
+            param.requires_grad = False
+            frozen_params += 1
+        else:
+            param.requires_grad = True
+            trainable_params += 1
+
+    print(f"Strategy executed: {frozen_params} parameters frozen, {trainable_params} parameters remain trainable.")
+
+    # --------------------------------------------------------------------------
+    # 5. Final verification (modified)
+    # --------------------------------------------------------------------------
+    print("\n--- Final model gradient status verification ---")
+    for name, param in model.named_parameters():
+        status = "🧊 [Frozen]" if not param.requires_grad else "✅ [Trainable]"
+        reason = ""
+        if not param.requires_grad:
+            if name in initially_frozen_keys:
+                reason = "(Reason: Initially Frozen)"
+            elif name.startswith('clip.'):
+                reason = "(Reason: CLIP Module)"
+            elif name in loadable_keys:
+                reason = "(Reason: Loaded from ckpt)"
+        print(f"{status} {name} {reason}")
+    print("---------------------------------")
+
+    return model
+
+
+def load_pretrained_weights_DP_T(model, ckpt_path):
+
+    # --------------------------------------------------------------------------
+    # ✨ 0. record initially frozen parameters
+    # --------------------------------------------------------------------------
+    initially_frozen_keys = {name for name, param in model.named_parameters() if not param.requires_grad}
+    if initially_frozen_keys:
+        print(f"Detected {len(initially_frozen_keys)} parameters were set to frozen state before function call. These parameters will remain frozen.")
+        # for name in initially_frozen_keys:
+        #     print(f"  - 初始冻结: {name}")
+
+    if not ckpt_path:
+        print("No checkpoint path provided, skipping weight loading.")
+        # Even if not loading weights, we still need to freeze CLIP and maintain initial frozen state
+        if hasattr(model, 'clip'):
+            print("Freezing CLIP module and setting to eval mode...")
+            model.clip.eval()
+            for name, param in model.clip.named_parameters():
+                param.requires_grad = False
+                print(f"🧊 [Force Freeze] {name}")
+        return model
+
+    manully_unfrozen_keys = [
+        "model.pos_emb",
+        # "model.input_emb.weight",
+        # "model.input_emb.bias",
+        "model.encoder.0.weight",
+        "model.encoder.0.bias",
+        "model.encoder.2.weight",
+        "model.encoder.2.bias",
+    ]
+    # --------------------------------------------------------------------------
+    # Step 1: Identify loadable weights
+    # --------------------------------------------------------------------------
+    print(f"Loading weights from '{ckpt_path}'...")
+    pretrained_dict = torch.load(ckpt_path, map_location='cpu')['state_dict']
+
+    new_model_dict = model.state_dict()
+    loadable_keys = set()
+    filtered_dict = {}
+
+    print("Filtering compatible weights...")
+    for k, v in pretrained_dict.items():
+        if k in new_model_dict and new_model_dict[k].shape == v.shape:
+            filtered_dict[k] = v
+            loadable_keys.add(k)
+    print(f"Identified {len(loadable_keys)} parameters that can be safely loaded from checkpoint.")
+
+    # --------------------------------------------------------------------------
+    # Step 2: Load filtered weights
+    # --------------------------------------------------------------------------
+    new_model_dict.update(filtered_dict)
+    model.load_state_dict(new_model_dict)
+    print("Successfully loaded all compatible weights.")
+
+    # --------------------------------------------------------------------------
+    # Step 3: Force-set CLIP module to eval mode
+    # --------------------------------------------------------------------------
+    if hasattr(model, 'clip'):
+        print("Freezing CLIP module and setting to eval mode...")
+        model.clip.eval()
+    else:
+        print("⚠️  Warning: 'clip' attribute not found in model, unable to set to eval mode.")
+
+    # --------------------------------------------------------------------------
+    # Step 4 (Modified): Smartly set gradient status based on loading, module name, and initial state
+    # --------------------------------------------------------------------------
+    print("Smartly setting parameter gradient status...")
+    trainable_params = 0
+    frozen_params = 0
+
+    for name, param in model.named_parameters():
+        # Check if the parameter was initially frozen
+        is_initially_frozen = name in initially_frozen_keys
+        # Check if the parameter belongs to the CLIP module
+        is_clip_param = name.startswith('clip.')
+        # Check if the parameter was loaded from checkpoint
+        is_loaded_from_ckpt = name in loadable_keys
+
+        is_manully_unfrozen = name in manully_unfrozen_keys
+
+        # Smart logic: Check if the bias's corresponding weight was also loaded
+        if name.endswith('.bias') and not is_clip_param and not is_initially_frozen:
+            weight_name = name.replace('.bias', '.weight')
+            if weight_name not in loadable_keys:
+                is_loaded_from_ckpt = False
+                print(f"ℹ️  Note: Bias '{name}' will remain trainable as its corresponding weight '{weight_name}' was not loaded.")
+
+        # Final freeze decision: Freeze if initially frozen, CLIP param, or loaded from checkpoint
+        if (is_initially_frozen or is_clip_param or is_loaded_from_ckpt) and not is_manully_unfrozen:
+            param.requires_grad = False
+            frozen_params += 1
+        else:
+            param.requires_grad = True
+            trainable_params += 1
+
+    # --------------------------------------------------------------------------
+    # Step 6: Shameful manual overrides
+    # --------------------------------------------------------------------------
+
+    print(f"Strategy execution complete: {frozen_params} parameters frozen, {trainable_params} parameters remain trainable.")
+    # --------------------------------------------------------------------------
+    # Step 7: Final validation
+    # --------------------------------------------------------------------------
+    print("\n--- Final model gradient status validation ---")
+    for name, param in model.named_parameters():
+        status = "🧊 [Frozen]" if not param.requires_grad else "✅ [Trainable]"
+        reason = ""
+        if not param.requires_grad:
+            if name in initially_frozen_keys:
+                reason = "(Reason: Initially Frozen)"
+            elif name.startswith('clip.'):
+                reason = "(Reason: CLIP Module)"
+            elif name in loadable_keys:
+                reason = "(Reason: Loaded from ckpt)"
+        print(f"{status} {name} {reason}")
+    print("---------------------------------")
+
+    return model
+
+
+def set_all_seeds(seed: int = 42) -> None:
+    """
+    Sets the random seed for reproducibility across all key libraries.
+
+    Args:
+        seed (int): The integer value to use as the random seed.
+    """
+    # 1. Set seed for Python's built-in random module
+    random.seed(seed)
+
+    # 2. Set seed for NumPy
+    np.random.seed(seed)
+
+    # 3. Set seed for PyTorch on CPU
+    torch.manual_seed(seed)
+
+    # 4. Set seeds for PyTorch on GPU(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # For multi-GPU setups
+
+    # 5. Set a fixed value for the hash seed
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+    # 6. Make PyTorch operations deterministic
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    print(f"Global random seed set to {seed} for reproducibility.")
+
+
+def seed_worker(worker_id: int) -> None:
+    """
+    Sets the random seed for each worker process to ensure reproducibility
+    of data loading and augmentation.
+    """
+    # The worker seed is derived from the main process's random state
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    print(f"Worker {worker_id} has been seeded with {worker_seed}")
+
+# ---------------------------------------------------------------
+# region 1. Trainer
+
+
+class Trainer_all(pl.LightningModule):
+    def __init__(self, cfg):
+        super().__init__()
+        self.save_hyperparameters()
+        self.cfg = cfg
+        task_type = cfg.train_mode
+        using_transformers = cfg.get("using_transformers", False)
+
+        if task_type == 'stage2' or task_type == 'stage2_rollout':
+            ckpt_path = cfg.ckpt_path
+            policy: DiffusionUnetHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
+            policy = load_pretrained_weights(policy, ckpt_path) if not using_transformers else load_pretrained_weights_DP_T(policy, ckpt_path)
+        elif task_type == 'stage1' or task_type == 'stage1_pure':
+            policy: DiffusionUnetHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
+        elif task_type == 'normal' or task_type == 'normal_rollout':
+            policy: DiffusionUnetHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
+        else:
+            raise ValueError(f"Unsupported task type: {task_type}, check config.train_mode")
+
+        if cfg.training.get("use_ema", False):
+            policy_ema: DiffusionUnetHybridImagePolicy = copy.deepcopy(policy)
+            ema_handler: EMAModel = hydra.utils.instantiate(
+                cfg.ema,
+                model=policy_ema,)
+            self.ema_handler = ema_handler
+            self.policy_ema = policy_ema.to(self.device)
+
+        self.policy = policy
+        self.train_sampling_batch = None
+
+        # debug
+        # for name, param in policy.named_parameters():
+        #     print(name)
+
+    def setup(self, stage='fit'):
+        if stage == 'fit':
+            self.normalizer = self.trainer.datamodule.normalizer
+            self.policy.set_normalizer(self.normalizer)
+            if self.cfg.training.get("use_ema", False):
+                self.policy_ema.set_normalizer(self.normalizer)
+
+        return
+
+    def training_step(self, batch):
+        # model = self.policy
+        # print("\n--- 最终模型梯度状态验证 ---")
+        # for name, param in model.named_parameters():
+        #     if param.requires_grad:
+        #         print(f"✅ [可训练] {name}")
+        #     else:
+        #         print(f"🧊 [已冻结] {name}")
+        # print("---------------------------------")
+
+        if self.train_sampling_batch is None:
+            self.train_sampling_batch = batch
+
+        loss = self.policy.compute_loss(batch)
+        self.logger.experiment.log({
+            'train/train_loss': loss.item(),
+            'train/lr': self.optimizers().param_groups[0]['lr'],
+            'trainer/global_step': self.global_step,
+            'trainer/epoch': self.current_epoch,
+        }, step=self.global_step)
+        # print('print for logging in Kubectl')
+        return loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """
+        This hook is called after the training step and optimizer update.
+        It's the perfect place to update the EMA weights.
+        """
+        if self.cfg.training.get("use_ema", False):
+            self.ema_handler.step(self.policy)
+
+    def validation_step(self, batch):
+
+        loss = self.policy_ema.compute_loss(batch) if self.cfg.training.get("use_ema", False) else self.policy.compute_loss(batch)
+        self.logger.experiment.log({
+            'train/val_loss': loss.item(),
+        }, step=self.global_step)
+        return loss
+
+    def configure_optimizers(self):
+        cfg: DictConfig = self.cfg
+
+        using_transformers = cfg.get("using_transformers", False)
+        using_ACT = cfg.get("using_ACT", False)
+        if using_transformers:
+            # 1. cfg
+            transformer_weight_decay = cfg.optimizer.transformer_weight_decay
+            obs_encoder_weight_decay = cfg.optimizer.obs_encoder_weight_decay
+            learning_rate = cfg.optimizer.learning_rate
+            betas = cfg.optimizer.betas
+            self.policy: DiffusionTransformerHybridImagePolicy
+
+            # 2. optimizer, the same as the diffusion_transformer_hybrid_image_policy.py
+            optim_groups = self.policy.model.get_optim_groups(
+                weight_decay=transformer_weight_decay)
+            optim_groups.append({
+                "params": self.policy.obs_encoder.parameters(),
+                "weight_decay": obs_encoder_weight_decay
+            })
+            optimizer = torch.optim.AdamW(
+                optim_groups, lr=learning_rate, betas=betas
+            )
+            # end of 2. optimizer
+            num_training_steps = self.trainer.estimated_stepping_batches
+
+            # 3.lr_scheduler
+            lr_scheduler = get_scheduler(
+                cfg.training.lr_scheduler,
+                optimizer=optimizer,
+                num_warmup_steps=cfg.training.lr_warmup_steps,
+                num_training_steps=int((
+                    num_training_steps)
+                    // cfg.training.gradient_accumulate_every),
+                # pytorch assumes stepping LRScheduler every epoch
+                # however huggingface diffusers steps it every batch
+                last_epoch=self.global_step - 1
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": lr_scheduler,
+                    "interval": "step",  # Make sure to step the scheduler every batch/step
+                    "frequency": 1,
+                },
+            }
+
+        if using_ACT:
+            optimizer = self.policy.optimizer
+            return optimizer
+
+        num_training_steps = self.trainer.estimated_stepping_batches
+
+        optimizer = hydra.utils.instantiate(cfg.optimizer, params=self.policy.parameters())
+        lr_scheduler = get_scheduler(
+            cfg.training.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=cfg.training.lr_warmup_steps,
+            num_training_steps=int((
+                num_training_steps)
+                // cfg.training.gradient_accumulate_every),
+            # pytorch assumes stepping LRScheduler every epoch
+            # however huggingface diffusers steps it every batch
+            last_epoch=self.global_step - 1
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": lr_scheduler,
+                "interval": "step",  # Make sure to step the scheduler every batch/step
+                "frequency": 1,
+            },
+        }
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]):
+        """
+        This hook is called when a checkpoint is saved.
+        We replace the full state_dict with ONLY the state_dict of the policy
+        we want to save (either the training policy or the EMA one).
+        """
+        if self.cfg.training.use_ema:
+            # Get the state_dict from your EMA model
+            policy_state_to_save = self.policy_ema.state_dict()
+        else:
+            # Get the state_dict from the standard training model
+            policy_state_to_save = self.policy.state_dict()
+
+        # Overwrite the complete state_dict with only the policy's state
+        checkpoint['state_dict'] = policy_state_to_save
+# endregion
+# ---------------------------------------------------------------
+
+
+# ---------------------------------------------------------------
+# region 2. DataModule
+class MyDataModule(pl.LightningDataModule):
+    def __init__(self, cfg: Any):
+        super().__init__()
+        self.cfg = cfg
+        # We'll store the generator to ensure deterministic shuffling
+        self.train_generator = None
+        self.val_generator = None
+
+    def setup(self, stage: str):
+        if stage == 'fit':
+            # Create the PyTorch Generator objects here based on the seed
+            seed = self.cfg.training.seed
+            self.train_generator = torch.Generator().manual_seed(seed)
+            self.val_generator = torch.Generator().manual_seed(seed)
+
+            # NOTE: Assuming these instantiate the datasets correctly
+            dataset = hydra.utils.instantiate(self.cfg.task.dataset)
+            val_dataset = dataset.get_validation_dataset()
+
+            assert isinstance(dataset, BaseImageDataset)
+            normalizer = dataset.get_normalizer()
+
+            self.normalizer = normalizer
+            self.dataset = dataset
+            self.val_dataset = val_dataset
+
+    def train_dataloader(self):
+        # Pass the worker_init_fn and the generator to the DataLoader
+        train_dataloader = DataLoader(
+            self.dataset,
+            **self.cfg.dataloader,
+            worker_init_fn=seed_worker,
+            generator=self.train_generator
+        )
+        return train_dataloader
+
+    def val_dataloader(self):
+        # Pass the worker_init_fn and the generator to the DataLoader
+        val_dataloader = DataLoader(
+            self.val_dataset,
+            **self.cfg.val_dataloader,
+            worker_init_fn=seed_worker,
+            generator=self.val_generator
+        )
+        return val_dataloader
+# endregion
+# ---------------------------------------------------------------
+
+# ---------------------------------------------------------------
+# region 3. Callback
+
+
+class RolloutCallback(pl.Callback):
+    """
+    A Callback to run a policy rollout in an environment periodically.
+    """
+
+    def __init__(self, env_runner_cfg: DictConfig, rollout_every_n_epochs: int = 1):
+        super().__init__()
+        env_runner: BaseImageRunner
+        env_runner = hydra.utils.instantiate(
+            env_runner_cfg,
+            output_dir='data/outputs'
+        )  # TODO:fix it
+
+        assert isinstance(env_runner, BaseImageRunner)
+        self.rollout_every_n_epochs = rollout_every_n_epochs
+        self.env_runner = env_runner
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: Trainer_all):
+        """
+        This hook is called after every validation epoch.
+        """
+
+        # Ensure we only run this every N epochs
+        if (trainer.current_epoch + 1) % self.rollout_every_n_epochs != 0:
+            return
+        if pl_module.global_step <= 0:
+            return
+        runner_log = self.env_runner.run(pl_module.policy_ema)
+        trainer.logger.experiment.log(runner_log, step=trainer.global_step)
+        # cprint(f"Rollout completed at epoch {trainer.current_epoch}, step {trainer.global_step}.", "green", attrs=['bold'])
+        # cprint(f"Rollout log: {runner_log}", "blue", attrs=['bold'])
+
+
+class ActionMseLossForDiffusion(pl.Callback):
+    """
+    A Callback to compute the MSE loss of actions in the diffusion model.
+    This is useful for training the diffusion model with action data.
+    """
+
+    def __init__(self, cfg: AppConfig):
+        super().__init__()
+        self.cfg = cfg
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: Trainer_all):
+        """
+        This hook is called after every validation epoch.
+        """
+        if pl_module.global_step <= 0:
+            return
+        train_sampling_batch = pl_module.train_sampling_batch
+
+        batch = dict_apply(train_sampling_batch, lambda x: x.to(pl_module.device, non_blocking=True))
+        obs_dict = batch['obs']
+        gt_action = batch['action']
+        result = pl_module.policy_ema.predict_action(obs_dict)
+        pred_action = result['action_pred']
+        mse = torch.nn.functional.mse_loss(pred_action, gt_action)
+        trainer.logger.experiment.log({
+            'train/action_mse_loss': mse,
+        }, step=trainer.global_step)
+
+
+# endregion
+# ---------------------------------------------------------------
+
+# ---------------------------------------------------------------
+# region Main
+
+
+def train(cfg: AppConfig):
+    set_all_seeds(cfg.training.seed)
+
+    using_transformers = cfg.get("using_transformers", False)
+    using_ACT = cfg.get("using_ACT", False)
+    # 0. extra config processing
+
+    cfg_env_runner = []
+    dataset_path = []
+    for key, value in cfg.train_tasks_meta.items():
+        this_dataset_path = f"data/robomimic/datasets/{key}/{key}_abs_{cfg.dataset_tail}.hdf5"
+        this_env_runner_cfg = copy.deepcopy(cfg.task.env_runner)
+        this_env_runner_cfg.dataset_path = this_dataset_path
+        this_env_runner_cfg.max_steps = value
+
+        OmegaConf.resolve(this_env_runner_cfg)
+        dataset_path.append(this_dataset_path)
+        cfg_env_runner.append(this_env_runner_cfg)
+    if using_ACT:
+        cfg.policy.max_timesteps = this_env_runner_cfg.max_steps
+    cfg.task.dataset.dataset_path = OmegaConf.create(dataset_path)
+
+    OmegaConf.save(cfg, os.path.join(cfg.run_dir, 'config.yaml'))
+    # 1. Define a unique name and directory for this specific run
+
+    this_run_dir = cfg.run_dir
+    run_name = cfg.run_name
+
+    os.makedirs(os.path.join(this_run_dir, 'wandb'), exist_ok=True)  # Ensure the output directory exists
+
+    ckpt_path = os.path.join(this_run_dir, 'checkpoints')
+    # 2. Configure ModelCheckpoint to save in that specific directory
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=ckpt_path,
+        filename=f'{run_name}' + '_{epoch:03d}',
+        every_n_epochs=cfg.training.checkpoint_every,
+        save_top_k=-1,
+        save_last=False,
+        save_weights_only=True,
+        save_on_train_epoch_end=True
+    )
+
+    # 3. Configure WandbLogger to use the same directory
+    wandb_logger = WandbLogger(
+        save_dir=this_run_dir,  # <-- Use save_dir to point to the same path
+        config=OmegaConf.to_container(cfg, resolve=True),
+        **cfg.logging,
+    )
+
+    #
+
+    if cfg.train_mode == 'stage1':
+        callback_list = [checkpoint_callback,
+                         ActionMseLossForDiffusion(cfg),
+                         ]
+    elif cfg.train_mode == 'stage1_pure':
+        callback_list = [checkpoint_callback,
+                         ]
+    elif cfg.train_mode == 'stage2':
+        callback_list = [checkpoint_callback,
+                         ActionMseLossForDiffusion(cfg),
+                         ]
+
+    elif cfg.train_mode == 'normal':
+        callback_list = [checkpoint_callback,
+                         ActionMseLossForDiffusion(cfg),
+                         ]
+    elif cfg.train_mode == 'stage2_rollout':
+        rollout_callback_list = [RolloutCallback(cfg_env_runner[i], rollout_every_n_epochs=cfg.training.rollout_every) for i in range(len(cfg_env_runner))]
+        callback_list = [checkpoint_callback,
+                         ActionMseLossForDiffusion(cfg),
+                         ]
+        callback_list.extend(rollout_callback_list)
+    elif cfg.train_mode == 'normal_rollout':
+        rollout_callback_list = [RolloutCallback(cfg_env_runner[i], rollout_every_n_epochs=cfg.training.rollout_every) for i in range(len(cfg_env_runner))]
+        callback_list = [checkpoint_callback,
+                         ActionMseLossForDiffusion(cfg),
+                         ]
+        callback_list.extend(rollout_callback_list)
+    else:
+        raise ValueError(f"Unsupported task type: {cfg.train_mode}, check config.name")
+
+    trainer = pl.Trainer(callbacks=callback_list,
+                         max_epochs=int(cfg.training.num_epochs),
+                         devices=[0],
+                         strategy='auto',
+                         logger=[wandb_logger],
+                         use_distributed_sampler=False,
+                         check_val_every_n_epoch=cfg.training.val_every,
+                         )
+    trainer_model = Trainer_all(cfg)
+    data_module = MyDataModule(cfg)
+    trainer.fit(trainer_model, datamodule=data_module)
+
+    # if cfg.train_mode == 'stage2':
+    #     scp_to_another_computer(
+    #         local_path=this_run_dir,
+    #         remote_path=os.path.join('/media/jian/ssd4t/tmp', run_name),
+    #         hostname='10.12.65.19',
+    #         username='jian',
+    #     )
+    #     wandb.finish()
+    #     evaluate_run(
+    #         seed=42,
+    #         run_dir=this_run_dir,)
+
+
+@hydra.main(
+    version_base=None,
+    config_path=str(pathlib.Path(__file__).parent.joinpath(
+        'jiandecouple', 'config'))
+)
+def main(cfg: OmegaConf):
+    # resolve immediately so all the ${now:} resolvers
+    # will use the same time.
+
+    OmegaConf.resolve(cfg)
+    train(cfg)
+
+
+# endregion
+# ---------------------------------------------------------------
+if __name__ == '__main__':
+    tasks_meta = {
+        "A": {"name": "stack_d1", "average_steps": 108, },
+        "B": {"name": "square_d2", "average_steps": 153, },
+        "C": {"name": "coffee_d2", "average_steps": 224, },
+        "D": {"name": "threading_d2", "average_steps": 227, },
+        "E": {"name": "stack_three_d1", "average_steps": 255, },
+        "F": {"name": "hammer_cleanup_d1", "average_steps": 286, },
+        "G": {"name": "three_piece_assembly_d2", "average_steps": 335, },
+        "H": {"name": "mug_cleanup_d1", "average_steps": 338, },
+        "I": {"name": "nut_assembly_d0", "average_steps": 358, },
+        "J": {"name": "kitchen_d1", "average_steps": 619, },
+        "K": {"name": "pick_place_d0", "average_steps": 677, },
+        "L": {"name": "coffee_preparation_d1", "average_steps": 687, },
+    }
+
+    max_steps = {meta['name']: int(meta['average_steps'] * 2.5) for task, meta in tasks_meta.items()}
+    print(f"max_steps: {max_steps}")
+
+    def get_ws_x_center(task_name):
+        if task_name.startswith('kitchen_') or task_name.startswith('hammer_cleanup_'):
+            return -0.2
+        else:
+            return 0.
+
+    def get_ws_y_center(task_name):
+        return 0.
+
+    def get_train_tasks_meta(task_alphabet):
+        task_alphabet_list = natsorted(task_alphabet)
+        train_tasks_meta = dict()
+        for task_alphabet in task_alphabet_list:
+            task_name = tasks_meta[task_alphabet]['name']
+            task_max_steps = max_steps[task_name]
+            train_tasks_meta.update({task_name: task_max_steps})
+        train_tasks_meta = OmegaConf.create(train_tasks_meta)
+        return train_tasks_meta
+
+    OmegaConf.register_new_resolver("get_train_tasks_meta", get_train_tasks_meta, replace=True)
+    OmegaConf.register_new_resolver("get_ws_x_center", get_ws_x_center, replace=True)
+    OmegaConf.register_new_resolver("get_ws_y_center", get_ws_y_center, replace=True)
+
+    # allows arbitrary python code execution in configs using the ${eval:''} resolver
+    OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+    main()

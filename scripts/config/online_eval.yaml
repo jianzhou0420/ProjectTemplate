@@ -1,0 +1,6 @@
+env_name: PickPlace_D0
+robot: Panda
+controller: JOINT_POSITION
+has_renderer: true
+record_video: false
+has_offscreen_renderer: false
