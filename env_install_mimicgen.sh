@@ -3,42 +3,43 @@
 set -e
 
 echo "--- 1. Creating and activating conda environment ---"
-mamba env create -f conda_environment.yaml -y
+mamba env create -f conda_environment_mimicgen.yaml -y
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate jiandecouple
 
 echo "--- 2. Installing robosuite ---"
 pip uninstall -y robosuite || true # Uninstall if exists, ignore if not
-cd third_party/robosuite
+cd third_party/mimicgen/robosuite
 pip install -e .
 echo "robosuite installed from:"
 python -c "import robosuite; print(robosuite.__file__)"
-cd ../.. # Return to the original directory
+cd ../../.. # Return to the original directory
 
 echo "--- 3. Installing robosuite-task-zoo ---"
 pip uninstall -y robosuite-task-zoo || true
-cd third_party/robosuite-task-zoo
+cd third_party/mimicgen/robosuite-task-zoo
 pip install -e .
 echo "robosuite_task_zoo installed from:"
 python -c "import robosuite_task_zoo; print(robosuite_task_zoo.__file__)"
-cd ../..
+cd ../../..
 
 echo "--- 4. Installing robomimic ---"
 pip uninstall -y robomimic || true
-cd third_party/robomimic
+cd third_party/mimicgen/robomimic
 pip install -e .
 echo "robomimic installed from:"
 python -c "import robomimic; print(robomimic.__file__)"
-cd ../..
+cd ../../..
 
 echo "--- 5. Installing mimicgen ---"
 pip uninstall -y mimicgen || true
-cd third_party/mimicgen
+cd third_party/mimicgen/mimicgen
 pip install -e .
 echo "mimicgen installed from:"
 python -c "import mimicgen; print(mimicgen.__file__)"
-cd ../..
+cd ../../..
 
 pip install -e .
+conda activate jiandecouple
 
 echo "--- ✅ All packages installed successfully! ---"

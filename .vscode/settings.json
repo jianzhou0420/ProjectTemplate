@@ -1,6 +1,6 @@
 {
-    // 让 Pylance 在这些目录里也查 import
     "python.analysis.extraPaths": [
+        "./third_party/mimicgen/mimicgen",
         "./third_party/mimicgen/robomimic",
         "./third_party/mimicgen/robosuite",
         "./third_party/mimicgen/robosuite-task-zoo",

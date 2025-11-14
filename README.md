@@ -8,3 +8,9 @@ Project Files to explore DecoupledActionHead
 > 📨 Contact: [ jianzhou0420@outlook.com / a1946536@adelaide.edu.au]
 
 ---
+
+
+# Credits
+
+1. Diffusion Policy
+2. equidiff

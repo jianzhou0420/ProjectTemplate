@@ -273,7 +273,7 @@ class RobomimicImageRunner(BaseImageRunner):
             policy.reset()
 
             env_name = self.env_meta['env_name']
-            pbar = tqdm.tqdm(total=self.max_steps, desc=f"Eval {env_name}Image {chunk_idx+1}/{n_chunks}",
+            pbar = tqdm.tqdm(total=self.max_steps, desc=f"Eval {env_name}Image {chunk_idx + 1}/{n_chunks}",
                              leave=False, mininterval=self.tqdm_interval_sec)
 
             done = False
